@@ -17,6 +17,15 @@ PROJECT = {"project_name": "org-demo", "dev_name": "work"}
 CONTAINER = "dev-org-demo-work"
 
 
+def fake_execution():
+    """A TunnelExec stand-in: mock poll/output, with the real wait() over them."""
+    execution = Mock()
+    execution.wait.side_effect = lambda *args, **kwargs: tunnel_exec.TunnelExec.wait(
+        execution, *args, **kwargs
+    )
+    return execution
+
+
 @pytest.fixture
 def fake_docker(monkeypatch):
     docker = Mock()
@@ -29,7 +38,7 @@ def fake_docker(monkeypatch):
         member.size = len(data)
         archive.addfile(member, io.BytesIO(data))
     docker.api.get_archive.return_value = (iter([buffer.getvalue()]), {})
-    monkeypatch.setattr(tunnel_exec.docker, "from_env", Mock(return_value=docker))
+    monkeypatch.setattr(tunnel_exec, "_client", docker)
     return docker
 
 
@@ -53,7 +62,7 @@ def test_exec_reads_output_and_status_without_attaching(fake_docker, returncode)
     cleanup = fake_docker.api.exec_create.call_args.args[1]
     assert cleanup[-1] == output_path
     assert "rm -f" in cleanup[2] and "kill" not in cleanup[2]
-    fake_docker.close.assert_called_once()
+    fake_docker.close.assert_not_called()  # the client is shared
 
 
 def test_close_stops_a_command_that_is_still_running(fake_docker):
@@ -70,7 +79,7 @@ def test_release_leaves_the_command_running(fake_docker):
     execution.close()  # no-op once released
     assert fake_docker.api.exec_create.call_count == 1
     assert fake_docker.api.exec_create.call_args.args[1][4] == "/tmp/log"
-    fake_docker.close.assert_called_once()
+    fake_docker.close.assert_not_called()  # the client is shared
 
 
 def test_exec_times_out_when_command_never_reports_completion(fake_docker):
@@ -78,7 +87,7 @@ def test_exec_times_out_when_command_never_reports_completion(fake_docker):
     with pytest.raises(subprocess.TimeoutExpired):
         tunnel_exec.run_tunnel_exec(CONTAINER, ["true"], timeout=0.1)
     fake_docker.api.get_archive.assert_not_called()
-    fake_docker.close.assert_called_once()
+    fake_docker.close.assert_not_called()  # the client is shared
 
 
 def test_exec_allows_output_file_to_be_created_after_start(fake_docker):
@@ -156,7 +165,7 @@ class FakeTunnelCli:
 
 @pytest.fixture
 def launched(monkeypatch):
-    launch = Mock()
+    launch = fake_execution()
     launch.poll.return_value = None
     launch.output.return_value = "Open this link in your browser https://vscode.dev/tunnel/x\n"
     factory = Mock(return_value=launch)
@@ -249,18 +258,17 @@ def test_workspace_dir_follows_the_mount(monkeypatch):
             {"Destination": "/workspaces/myapp"},
         ]
     }
-    monkeypatch.setattr(tunnel_exec.docker, "from_env", Mock(return_value=client))
-    assert routes._workspace_dir(CONTAINER) == "/workspaces/myapp"
+    monkeypatch.setattr(tunnel_exec, "_client", client)
+    assert routes._workspace_dir(CONTAINER, "/workspaces/default") == "/workspaces/myapp"
 
 
-def test_workspace_dir_fallback_strips_configured_prefix(monkeypatch):
+def test_workspace_dir_falls_back_without_a_workspace_mount(monkeypatch):
     monkeypatch.setattr(routes, "container_workspace_dir", Mock(return_value=None))
-    monkeypatch.setattr(routes.config, "project_prefix", "box")
-    assert routes._workspace_dir("box-org-demo-work") == "/workspaces/org-demo-work"
+    assert routes._workspace_dir(CONTAINER, "/workspaces/default") == "/workspaces/default"
 
 
 def test_device_flow_uses_remote_completion(monkeypatch):
-    execution = Mock()
+    execution = fake_execution()
     execution.poll.return_value = None
     execution.output.return_value = (
         "Go to https://github.com/login/device\nand use code ABCD-1234\n"
@@ -285,7 +293,7 @@ def test_device_flow_uses_remote_completion(monkeypatch):
 
 
 def test_overlapping_auth_requests_share_one_login(monkeypatch):
-    execution = Mock()
+    execution = fake_execution()
     execution.poll.return_value = None
     outputs = iter(["", "", "", ""])
     execution.output.side_effect = lambda: next(
@@ -294,7 +302,7 @@ def test_overlapping_auth_requests_share_one_login(monkeypatch):
     factory = Mock(return_value=execution)
     monkeypatch.setattr(routes, "TunnelExec", factory)
     monkeypatch.setattr(routes, "_auth_processes", {})
-    monkeypatch.setattr(routes.time, "sleep", lambda _: None)
+    monkeypatch.setattr(tunnel_exec.time, "sleep", lambda _: None)
     client = TestClient(app)
 
     with ThreadPoolExecutor(2) as pool:

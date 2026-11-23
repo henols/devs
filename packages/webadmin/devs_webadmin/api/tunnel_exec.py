@@ -3,9 +3,10 @@
 import io
 import subprocess
 import tarfile
+import threading
 import time
 from contextlib import closing, suppress
-from typing import Optional
+from typing import Callable, Optional, Tuple
 from uuid import uuid4
 
 import docker
@@ -21,17 +22,17 @@ _WRAPPER = (
 _STOP = 'pid=$(cat "$1.pid" 2>/dev/null) && kill "$pid" 2>/dev/null; '
 _CLEANUP = 'rm -f -- "$1" "$1.pid"'
 
+_client: Optional[docker.DockerClient] = None
+_client_lock = threading.Lock()
 
-def _read_file(client: docker.DockerClient, container_name: str, path: str) -> str:
-    try:
-        archive, _ = client.api.get_archive(container_name, path)
-    except NotFound:
-        # The command may not have opened the output file yet.
-        return ""
-    with tarfile.open(fileobj=io.BytesIO(b"".join(archive))) as stream:
-        member = stream.next()
-        output = stream.extractfile(member) if member is not None else None
-        return output.read().decode("utf-8", errors="replace") if output else ""
+
+def docker_client() -> docker.DockerClient:
+    """One Docker client, and connection pool, shared by every tunnel call."""
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = docker.from_env(timeout=5)
+        return _client
 
 
 class TunnelExec:
@@ -50,8 +51,9 @@ class TunnelExec:
         self._container = container_name
         self._path = output_path or f"/tmp/.devs-tunnel-{uuid4().hex}"
         self._closed = False
+        self._id: Optional[str] = None
         self._returncode: Optional[int] = None
-        self._client = docker.from_env(timeout=5)
+        self._api = docker_client().api
         try:
             self._id = self._start(
                 ["/bin/sh", "-c", _WRAPPER, "sh", self._path, *command]
@@ -61,55 +63,72 @@ class TunnelExec:
             raise
 
     def _start(self, command: list) -> str:
-        api = self._client.api
-        exec_id: str = api.exec_create(self._container, command)["Id"]
-        api.exec_start(exec_id, detach=True)
+        exec_id: str = self._api.exec_create(self._container, command)["Id"]
+        self._api.exec_start(exec_id, detach=True)
         return exec_id
 
     def poll(self) -> Optional[int]:
-        if self._returncode is None:
-            state = self._client.api.exec_inspect(self._id)
+        if self._returncode is None and self._id is not None:
+            state = self._api.exec_inspect(self._id)
             if not state["Running"]:
                 self._returncode = state["ExitCode"]
         return self._returncode
 
     def output(self) -> str:
-        return _read_file(self._client, self._container, self._path)
+        try:
+            archive, _ = self._api.get_archive(self._container, self._path)
+        except NotFound:
+            # The command may not have opened the output file yet.
+            return ""
+        with tarfile.open(fileobj=io.BytesIO(b"".join(archive))) as stream:
+            member = stream.next()
+            output = stream.extractfile(member) if member is not None else None
+            return output.read().decode("utf-8", errors="replace") if output else ""
+
+    def wait(
+        self,
+        timeout: float,
+        interval: float,
+        until: Optional[Callable[[str], object]] = None,
+    ) -> Tuple[Optional[int], str]:
+        """Poll until the command exits, ``until(output)`` is true, or the timeout.
+
+        Returns the exit code (None if still running) and the output so far.
+        Without ``until``, the output is read only once the command has exited.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            returncode = self.poll()
+            output = self.output() if returncode is not None or until else ""
+            if returncode is not None or (until and until(output)):
+                return returncode, output
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, output
+            time.sleep(min(interval, remaining))
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            with suppress(DockerException, OSError):
-                running = getattr(self, "_id", None) is not None and self.poll() is None
-                script = (_STOP if running else "") + _CLEANUP
-                self._start(["/bin/sh", "-c", script, "sh", self._path])
-        finally:
-            self._client.close()
+        with suppress(DockerException, OSError):
+            running = self._id is not None and self.poll() is None
+            script = (_STOP if running else "") + _CLEANUP
+            self._start(["/bin/sh", "-c", script, "sh", self._path])
 
     def release(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._client.close()
+        self._closed = True
 
 
 def run_tunnel_exec(
     container_name: str, command: list, timeout: float = 10
 ) -> subprocess.CompletedProcess:
     """Return the remote exit code and output within the polling deadline."""
-    deadline = time.monotonic() + timeout
     with closing(TunnelExec(container_name, command)) as execution:
-        while True:
-            returncode = execution.poll()
-            if returncode is not None:
-                return subprocess.CompletedProcess(
-                    command, returncode, stdout=execution.output()
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(command, timeout)
-            time.sleep(min(remaining, 0.1))
+        returncode, output = execution.wait(timeout, 0.1)
+    if returncode is None:
+        raise subprocess.TimeoutExpired(command, timeout)
+    return subprocess.CompletedProcess(command, returncode, stdout=output)
 
 
 def container_workspace_dir(container_name: str) -> Optional[str]:
@@ -118,8 +137,7 @@ def container_workspace_dir(container_name: str) -> Optional[str]:
     Live-mode containers mount the host folder under its own name, so the path
     can't be derived from the container name.
     """
-    with closing(docker.from_env(timeout=5)) as client:
-        mounts = client.api.inspect_container(container_name).get("Mounts") or []
+    mounts = docker_client().api.inspect_container(container_name).get("Mounts") or []
     for mount in mounts:
         destination = mount.get("Destination") or ""
         parts = destination.strip("/").split("/")

@@ -7,7 +7,6 @@ import json
 import re
 import subprocess
 import threading
-import time
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, HTTPException
@@ -36,6 +35,8 @@ _TUNNEL_LOG = "/tmp/vscode-tunnel.log"
 _TUNNEL_PATTERN = "code tunnel --accept-server-license-terms"
 # How long Start waits for the new tunnel to connect or ask for a device login.
 _START_GRACE_SECONDS = 8.0
+# How long sign-in waits for the GitHub device code.
+_AUTH_TIMEOUT_SECONDS = 30.0
 _auth_processes: Dict[str, TunnelExec] = {}
 _auth_locks: Dict[str, threading.Lock] = {}
 _auth_locks_guard = threading.Lock()
@@ -236,32 +237,10 @@ async def clean_container(request: ContainerActionRequest) -> dict:
 
 # --- Tunnel helpers ---
 
-def _tunnel_error(result: subprocess.CompletedProcess) -> str:
-    if result.returncode == 127:
+def _tunnel_error(returncode: int, output: str) -> str:
+    if returncode == 127:
         return f"Install the standalone VS Code CLI at {_TUNNEL_CLI} in the devcontainer."
-    return result.stdout.strip() or f"VS Code CLI exited with status {result.returncode}."
-
-
-def _tunnel_info(project_name: str, dev_name: str) -> dict:
-    """Derive tunnel-related names from project_name + dev_name."""
-    container_name = _get_container_name(project_name, dev_name)
-    return {
-        "container_name": container_name,
-        "tunnel_name": make_tunnel_name(container_name),
-    }
-
-
-def _workspace_dir(container_name: str) -> str:
-    """The folder to open over the tunnel: the container's real workspace mount."""
-    try:
-        mounted = container_workspace_dir(container_name)
-    except Exception:
-        mounted = None
-    if mounted:
-        return mounted
-    prefix = f"{config.project_prefix if config else 'dev'}-"
-    name = container_name[len(prefix):] if container_name.startswith(prefix) else container_name
-    return f"/workspaces/{name}"
+    return output.strip() or f"VS Code CLI exited with status {returncode}."
 
 
 def _tunnel_state(container_name: str) -> Optional[dict]:
@@ -280,6 +259,14 @@ def _tunnel_state(container_name: str) -> Optional[dict]:
     return None
 
 
+def _workspace_dir(container_name: str, default: str) -> str:
+    """The folder to open over the tunnel: the container's real workspace mount."""
+    try:
+        return container_workspace_dir(container_name) or default
+    except Exception:
+        return default
+
+
 def _kill_tunnel(container_name: str) -> None:
     """Stop the tunnel, whether or not the CLI singleton still answers."""
     try:
@@ -287,7 +274,7 @@ def _kill_tunnel(container_name: str) -> None:
     except subprocess.TimeoutExpired:
         result = None
     if result is not None and result.returncode == 127:
-        raise HTTPException(status_code=400, detail=_tunnel_error(result))
+        raise HTTPException(status_code=400, detail=_tunnel_error(127, result.stdout))
     # `code tunnel kill` fails when nothing is running, and can't reach a tunnel
     # whose singleton is wedged; pkill covers both (exit 1 = nothing matched).
     run_tunnel_exec(container_name, ["pkill", "-f", _TUNNEL_PATTERN])
@@ -316,25 +303,27 @@ def _auth_lock(container_name: str) -> threading.Lock:
 @router.get("/tunnel/status")
 async def tunnel_status(project_name: str, dev_name: str) -> dict:
     """Get VS Code tunnel status for a container."""
-    info = _tunnel_info(project_name, dev_name)
-    container_name = info["container_name"]
-    try:
-        tunnel_data = await _to_thread(_tunnel_state, container_name) or {}
-        is_connected = tunnel_data.get("tunnel") == "Connected"
+    container_name = _get_container_name(project_name, dev_name)
 
+    def _status() -> dict:
+        tunnel = _tunnel_state(container_name) or {}
         # Use the actual tunnel name from status if available
-        actual_tunnel_name = tunnel_data.get("name") or info["tunnel_name"]
-        if not is_connected:
-            return {"running": False, "tunnel_name": actual_tunnel_name,
+        tunnel_name = tunnel.get("name") or make_tunnel_name(container_name)
+        if tunnel.get("tunnel") != "Connected":
+            return {"running": False, "tunnel_name": tunnel_name,
                     "web_url": None, "vscode_cmd": None}
-
-        workspace_dir = await _to_thread(_workspace_dir, container_name)
+        workspace_dir = _workspace_dir(
+            container_name, f"/workspaces/{project_name}-{dev_name}"
+        )
         return {
             "running": True,
-            "tunnel_name": actual_tunnel_name,
-            "web_url": f"https://vscode.dev/tunnel/{actual_tunnel_name}{workspace_dir}",
-            "vscode_cmd": f"code --remote tunnel+{actual_tunnel_name} {workspace_dir}",
+            "tunnel_name": tunnel_name,
+            "web_url": f"https://vscode.dev/tunnel/{tunnel_name}{workspace_dir}",
+            "vscode_cmd": f"code --remote tunnel+{tunnel_name} {workspace_dir}",
         }
+
+    try:
+        return await _to_thread(_status)
     except subprocess.TimeoutExpired:
         return {"running": False, "message": "Status check timed out"}
     except Exception as e:
@@ -351,9 +340,8 @@ async def tunnel_start(request: TunnelRequest) -> dict:
     returns {"status": "waiting_for_browser", device_url, device_code}; the
     tunnel connects by itself once the user completes it.
     """
-    info = _tunnel_info(request.project_name, request.dev_name)
-    container_name = info["container_name"]
-    tunnel_name = info["tunnel_name"]
+    container_name = _get_container_name(request.project_name, request.dev_name)
+    tunnel_name = make_tunnel_name(container_name)
 
     def _start() -> dict:
         result = run_tunnel_exec(
@@ -362,7 +350,9 @@ async def tunnel_start(request: TunnelRequest) -> dict:
         if result.returncode == 1 and "not logged in" in result.stdout.lower():
             return {"status": "auth_required", "tunnel_name": tunnel_name}
         if result.returncode != 0:
-            raise HTTPException(status_code=400, detail=_tunnel_error(result))
+            raise HTTPException(
+                status_code=400, detail=_tunnel_error(result.returncode, result.stdout)
+            )
 
         existing = _tunnel_state(container_name)
         if existing is not None:
@@ -377,21 +367,18 @@ async def tunnel_start(request: TunnelRequest) -> dict:
             output_path=_TUNNEL_LOG,
         )
         try:
-            deadline = time.monotonic() + _START_GRACE_SECONDS
-            while True:
-                returncode = launch.poll()
-                log = launch.output()
-                device = _device_login(log)
-                if device:
-                    return {"status": "waiting_for_browser", "tunnel_name": tunnel_name, **device}
-                if returncode is not None:
-                    detail = _tunnel_error(subprocess.CompletedProcess([], returncode, log))
-                    raise HTTPException(status_code=400, detail=detail)
-                if "vscode.dev/tunnel" in log or time.monotonic() >= deadline:
-                    return {"status": "starting", "tunnel_name": tunnel_name}
-                time.sleep(0.5)
+            returncode, log = launch.wait(
+                _START_GRACE_SECONDS, 0.5,
+                until=lambda log: _device_login(log) or "vscode.dev/tunnel" in log,
+            )
         finally:
             launch.release()
+        device = _device_login(log)
+        if device:
+            return {"status": "waiting_for_browser", "tunnel_name": tunnel_name, **device}
+        if returncode is not None:
+            raise HTTPException(status_code=400, detail=_tunnel_error(returncode, log))
+        return {"status": "starting", "tunnel_name": tunnel_name}
 
     try:
         return await _to_thread(_start)
@@ -406,9 +393,9 @@ async def tunnel_start(request: TunnelRequest) -> dict:
 @router.post("/tunnel/kill")
 async def tunnel_kill(request: TunnelRequest) -> dict:
     """Kill the VS Code tunnel; succeeds when none is running."""
-    info = _tunnel_info(request.project_name, request.dev_name)
+    container_name = _get_container_name(request.project_name, request.dev_name)
     try:
-        await _to_thread(_kill_tunnel, info["container_name"])
+        await _to_thread(_kill_tunnel, container_name)
         return {"killed": True, "message": "Tunnel processes killed"}
     except HTTPException:
         raise
@@ -427,8 +414,7 @@ async def tunnel_auth_start(request: TunnelRequest) -> dict:
     The process keeps running until auth completes or is cancelled.
     A repeated request reuses the pending login instead of starting another.
     """
-    info = _tunnel_info(request.project_name, request.dev_name)
-    container_name = info["container_name"]
+    container_name = _get_container_name(request.project_name, request.dev_name)
 
     def _start_auth() -> dict:
         # Serialise per container, so overlapping requests share one login.
@@ -439,30 +425,26 @@ async def tunnel_auth_start(request: TunnelRequest) -> dict:
                     container_name,
                     [_TUNNEL_CLI, "tunnel", "user", "login", "--provider", "github"],
                 )
-            keep_open = False
             try:
-                deadline = time.monotonic() + 30
-                while True:
-                    returncode = execution.poll()
-                    if returncode == 0:
-                        return {"status": "already_authenticated"}
-                    output = execution.output()
-                    if returncode is not None:
-                        return {
-                            "status": "error",
-                            "message": "Could not get device code. " + output.strip(),
-                        }
-                    device = _device_login(output)
-                    if device:
-                        _auth_processes[container_name] = execution
-                        keep_open = True
-                        return {"status": "waiting_for_browser", **device}
-                    if time.monotonic() >= deadline:
-                        raise subprocess.TimeoutExpired("VS Code GitHub sign-in", 30)
-                    time.sleep(0.25)
-            finally:
-                if not keep_open:
-                    execution.close()
+                returncode, output = execution.wait(
+                    _AUTH_TIMEOUT_SECONDS, 0.5, until=_device_login
+                )
+            except BaseException:
+                execution.close()
+                raise
+            device = _device_login(output)
+            if returncode is None and device:
+                _auth_processes[container_name] = execution
+                return {"status": "waiting_for_browser", **device}
+            execution.close()
+        if returncode == 0:
+            return {"status": "already_authenticated"}
+        if returncode is not None:
+            return {
+                "status": "error",
+                "message": "Could not get device code. " + output.strip(),
+            }
+        raise subprocess.TimeoutExpired("VS Code GitHub sign-in", _AUTH_TIMEOUT_SECONDS)
 
     try:
         return await _to_thread(_start_auth)
@@ -475,8 +457,7 @@ async def tunnel_auth_start(request: TunnelRequest) -> dict:
 @router.get("/tunnel/auth/status")
 async def tunnel_auth_status(project_name: str, dev_name: str) -> dict:
     """Check if a pending tunnel auth has completed."""
-    info = _tunnel_info(project_name, dev_name)
-    container_name = info["container_name"]
+    container_name = _get_container_name(project_name, dev_name)
 
     execution = _auth_processes.get(container_name)
     if execution is None:
