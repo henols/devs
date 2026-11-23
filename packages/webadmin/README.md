@@ -58,6 +58,10 @@ The UI has two main sections:
 
 ### Tunnel Controls
 
+If Webadmin connects through a Docker socket proxy, allow detached exec, exec
+inspection and read access to the container archive endpoint. Webadmin uses the
+archive endpoint to read temporary CLI output without an attached exec stream.
+
 Each running container shows a tunnel panel:
 
 - **Start tunnel** -- Launches a VS Code tunnel in the container. Once running, shows an "Open in browser" link to `vscode.dev`.

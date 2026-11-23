@@ -1,83 +1,83 @@
-"""Run short commands with the tunnel CLI over Docker exec."""
+"""Run VS Code tunnel commands without an attached Docker exec stream."""
 
+import io
 import subprocess
+import tarfile
 import time
-from queue import Empty, Queue
-from threading import Thread
+from contextlib import closing, suppress
 from typing import Optional
 from uuid import uuid4
 
+import docker
+from docker.errors import DockerException, NotFound
+
 
 class TunnelExec:
-    """Read command completion even when a Docker proxy keeps the stream open."""
+    """Read output and exit status through ordinary Docker API requests."""
 
     def __init__(self, container_name: str, command: list) -> None:
-        # Docker exec can deliver all output through a proxy without delivering EOF.
-        # Let the in-container shell report the exit code before closing the client.
-        self._marker = f"devs-exec-{uuid4().hex}:"
-        self._lines = Queue()
-        self.returncode = None
-        self._process = subprocess.Popen(
-            [
-                "docker",
-                "exec",
-                container_name,
-                "/bin/sh",
-                "-c",
-                'marker=$1; shift; "$@"; status=$?; '
-                'printf "\\n%s%d\\n" "$marker" "$status"; exit "$status"',
-                "sh",
-                self._marker,
-                *command,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-        )
-        Thread(target=self._read_output, daemon=True).start()
-
-    def _read_output(self) -> None:
+        # TCP proxies can forward the first exec output frame but lose the remaining
+        # output and EOF. Use detached exec, inspect, and a private output file.
+        self._container = container_name
+        self._path = f"/tmp/.devs-tunnel-{uuid4().hex}"
+        self._client = docker.from_env(timeout=5)
         try:
-            assert self._process.stdout is not None
-            with self._process.stdout as output:
-                for line in output:
-                    if line.startswith(self._marker):
-                        self.returncode = int(line[len(self._marker) :].strip())
-                        return
-                    self._lines.put(line)
-            # EOF without the completion marker indicates an exec transport failure.
-            self.returncode = self._process.poll() or 1
-        finally:
+            self._id = self._start(
+                [
+                    "/bin/sh",
+                    "-c",
+                    'umask 077; output=$1; shift; exec "$@" > "$output" 2>&1',
+                    "sh",
+                    self._path,
+                    *command,
+                ]
+            )
+        except BaseException:
             self.close()
-            self._lines.put(None)
+            raise
 
-    def read_line(self, deadline: float) -> Optional[str]:
-        remaining = max(0, deadline - time.monotonic())
+    def _start(self, command: list) -> str:
+        api = self._client.api
+        exec_id = api.exec_create(self._container, command)["Id"]
+        api.exec_start(exec_id, detach=True)
+        return exec_id
+
+    def poll(self) -> Optional[int]:
+        state = self._client.api.exec_inspect(self._id)
+        return None if state["Running"] else state["ExitCode"]
+
+    def output(self) -> str:
         try:
-            return self._lines.get(timeout=remaining)
-        except Empty:
-            raise subprocess.TimeoutExpired(self._process.args, remaining) from None
+            archive, _ = self._client.api.get_archive(self._container, self._path)
+        except NotFound:
+            # The command may not have opened the output file yet.
+            return ""
+        with tarfile.open(fileobj=io.BytesIO(b"".join(archive))) as stream:
+            member = stream.next()
+            output = stream.extractfile(member) if member is not None else None
+            return output.read().decode("utf-8", errors="replace") if output else ""
 
     def close(self) -> None:
-        if self._process.poll() is None:
-            self._process.kill()
-        self._process.wait()
+        try:
+            with suppress(DockerException, OSError):
+                self._start(["rm", "-f", "--", self._path])
+        finally:
+            self._client.close()
 
 
 def run_tunnel_exec(
     container_name: str, command: list, timeout: float = 10
 ) -> subprocess.CompletedProcess:
-    """Return the remote exit code and combined output within the deadline."""
-    execution = TunnelExec(container_name, command)
+    """Return the remote exit code and output within the polling deadline."""
     deadline = time.monotonic() + timeout
-    output = []
-    try:
-        while (line := execution.read_line(deadline)) is not None:
-            output.append(line)
-        return subprocess.CompletedProcess(
-            command, execution.returncode, stdout="".join(output)
-        )
-    finally:
-        execution.close()
+    with closing(TunnelExec(container_name, command)) as execution:
+        while True:
+            returncode = execution.poll()
+            if returncode is not None:
+                return subprocess.CompletedProcess(
+                    command, returncode, stdout=execution.output()
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            time.sleep(min(remaining, 0.1))

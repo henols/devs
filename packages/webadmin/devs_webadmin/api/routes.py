@@ -362,21 +362,26 @@ async def tunnel_auth_start(request: TunnelRequest) -> dict:
     info = _tunnel_info(request.project_name, request.dev_name)
     container_name = info["container_name"]
 
-    previous = _auth_processes.pop(container_name, None)
-    if previous is not None:
-        await asyncio.to_thread(previous.close)
-
     def _start_auth() -> dict:
-        execution = TunnelExec(
-            container_name, [_TUNNEL_CLI, "tunnel", "user", "login", "--provider", "github"]
-        )
+        execution = _auth_processes.pop(container_name, None)
+        if execution is None:
+            execution = TunnelExec(
+                container_name,
+                [_TUNNEL_CLI, "tunnel", "user", "login", "--provider", "github"],
+            )
         keep_open = False
         try:
-            output_lines = []
             deadline = time.monotonic() + 30
-            while (line := execution.read_line(deadline)) is not None:
-                output_lines.append(line)
-                output = " ".join(output_lines)
+            while True:
+                returncode = execution.poll()
+                if returncode == 0:
+                    return {"status": "already_authenticated"}
+                output = execution.output()
+                if returncode is not None:
+                    return {
+                        "status": "error",
+                        "message": "Could not get device code. " + output.strip(),
+                    }
                 url = re.search(r"https://github\.com/login/device", output)
                 code = re.search(r"code\s+([A-Z0-9]{4}-[A-Z0-9]{4})", output, re.IGNORECASE)
                 if url and code:
@@ -389,12 +394,9 @@ async def tunnel_auth_start(request: TunnelRequest) -> dict:
                         "device_code": device_code,
                         "message": f"Open {device_url} and enter code {device_code}",
                     }
-            if execution.returncode == 0:
-                return {"status": "already_authenticated"}
-            return {
-                "status": "error",
-                "message": "Could not get device code. " + "".join(output_lines[-5:]).strip(),
-            }
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("VS Code GitHub sign-in", 30)
+                time.sleep(0.25)
         finally:
             if not keep_open:
                 execution.close()
@@ -417,11 +419,16 @@ async def tunnel_auth_status(project_name: str, dev_name: str) -> dict:
     if execution is None:
         return {"status": "no_pending_auth"}
 
-    returncode = execution.returncode
+    try:
+        returncode = await asyncio.to_thread(execution.poll)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if returncode is None:
         return {"status": "waiting_for_browser"}
 
-    del _auth_processes[container_name]
+    if _auth_processes.get(container_name) is execution:
+        del _auth_processes[container_name]
+        await asyncio.to_thread(execution.close)
     if returncode == 0:
         return {"status": "authenticated"}
     else:
