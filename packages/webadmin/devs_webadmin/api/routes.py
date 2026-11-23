@@ -1,6 +1,7 @@
 """API routes for webadmin."""
 
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -15,7 +16,6 @@ from devs_common.core.container import (
     ContainerManager,
     make_tunnel_name,
     get_container_workspace_dir,
-    kill_tunnel_processes,
 )
 from devs_common.core.workspace import WorkspaceManager
 from devs_common.core.project import Project
@@ -25,13 +25,15 @@ from devs_common.devs_config import DevsConfigLoader
 from devs_common.exceptions import DevsError
 
 from ..config import config
+from .tunnel_exec import TunnelExec, run_tunnel_exec
 
 logger = structlog.get_logger()
 
 router = APIRouter(prefix="/api")
 
-# Track running tunnel auth processes: container_name -> subprocess.Popen
-_auth_processes: Dict[str, subprocess.Popen] = {}
+_TUNNEL_CLI = "/usr/local/bin/code"
+_TUNNEL_LOG = "/tmp/vscode-tunnel.log"
+_auth_processes: Dict[str, TunnelExec] = {}
 
 
 class StartRequest(BaseModel):
@@ -220,10 +222,10 @@ async def clean_container(request: ContainerActionRequest) -> dict:
 
 # --- Tunnel helpers ---
 
-def _docker_exec(container_name: str, cmd: list, timeout: int = 10) -> subprocess.CompletedProcess:
-    """Run a docker exec command."""
-    full_cmd = ["docker", "exec", container_name] + cmd
-    return subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
+def _tunnel_error(result: subprocess.CompletedProcess) -> str:
+    if result.returncode == 127:
+        return f"Install the standalone VS Code CLI at {_TUNNEL_CLI} in the devcontainer."
+    return result.stdout.strip() or f"VS Code CLI exited with status {result.returncode}."
 
 
 def _tunnel_info(project_name: str, dev_name: str) -> dict:
@@ -248,17 +250,19 @@ async def tunnel_status(project_name: str, dev_name: str) -> dict:
     info = _tunnel_info(project_name, dev_name)
     try:
         result = await asyncio.to_thread(
-            _docker_exec, info["container_name"],
-            ["/usr/local/bin/code", "tunnel", "status"]
+            run_tunnel_exec, info["container_name"], [_TUNNEL_CLI, "tunnel", "status"]
         )
 
-        import json
         raw_status = {}
         if result.returncode == 0:
-            try:
-                raw_status = json.loads(result.stdout.strip())
-            except json.JSONDecodeError:
-                pass
+            for line in reversed(result.stdout.splitlines()):
+                try:
+                    status = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(status, dict) and "tunnel" in status:
+                    raw_status = status
+                    break
 
         tunnel_data = raw_status.get("tunnel") or {}
         is_connected = tunnel_data.get("tunnel") == "Connected"
@@ -291,38 +295,39 @@ async def tunnel_start(request: TunnelRequest) -> dict:
     info = _tunnel_info(request.project_name, request.dev_name)
     container_name = info["container_name"]
     tunnel_name = info["tunnel_name"]
-    log_file = "/tmp/vscode-tunnel.log"
-    tunnel_cmd = f"/usr/local/bin/code tunnel --accept-server-license-terms --name {tunnel_name}"
 
     def _start() -> dict:
-        # Kill any stale tunnel processes and clear log before starting
-        kill_tunnel_processes(container_name)
-        subprocess.run(
-            ["docker", "exec", container_name, "/bin/sh", "-c", f"> {log_file}"],
-            capture_output=True,
+        result = run_tunnel_exec(
+            container_name, [_TUNNEL_CLI, "tunnel", "user", "show"]
         )
-        time.sleep(1)
-
-        # Check for auth_required before launching (fast check via existing log)
-        result = subprocess.run(
-            ["docker", "exec", container_name, "cat", log_file],
-            capture_output=True, text=True,
-        )
-        output = result.stdout
-        if "log in" in output.lower() or "device" in output.lower() or "invalid" in output.lower():
+        if result.returncode == 1 and "not logged in" in result.stdout.lower():
             return {"status": "auth_required", "tunnel_name": tunnel_name}
+        if result.returncode != 0:
+            raise HTTPException(status_code=400, detail=_tunnel_error(result))
 
-        # Launch tunnel in background and return immediately
-        subprocess.run(
-            ["docker", "exec", "-d", container_name,
-             "/bin/sh", "-c", f"{tunnel_cmd} > {log_file} 2>&1"],
-            check=True,
+        # The VS Code CLI's singleton handles an already-running tunnel.
+        result = subprocess.run(
+            [
+                "docker", "exec", "-d", container_name, "/bin/sh", "-c",
+                'log=$1; shift; exec "$@" > "$log" 2>&1',
+                "sh", _TUNNEL_LOG, _TUNNEL_CLI, "tunnel",
+                "--accept-server-license-terms", "--name", tunnel_name,
+            ],
+            capture_output=True, text=True, timeout=10,
         )
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=400, detail=result.stderr.strip() or _tunnel_error(result)
+            )
 
         return {"status": "starting", "tunnel_name": tunnel_name}
 
     try:
         return await asyncio.to_thread(_start)
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Tunnel startup timed out.") from None
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -332,8 +337,16 @@ async def tunnel_kill(request: TunnelRequest) -> dict:
     """Kill a running VS Code tunnel."""
     info = _tunnel_info(request.project_name, request.dev_name)
     try:
-        await asyncio.to_thread(kill_tunnel_processes, info["container_name"])
+        result = await asyncio.to_thread(
+            run_tunnel_exec, info["container_name"], [_TUNNEL_CLI, "tunnel", "kill"]
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=400, detail=_tunnel_error(result))
         return {"killed": True, "message": "Tunnel processes killed"}
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Tunnel shutdown timed out.") from None
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -349,74 +362,47 @@ async def tunnel_auth_start(request: TunnelRequest) -> dict:
     info = _tunnel_info(request.project_name, request.dev_name)
     container_name = info["container_name"]
 
-    # Kill any existing auth process for this container
-    if container_name in _auth_processes:
-        try:
-            _auth_processes[container_name].kill()
-        except Exception:
-            pass
-        del _auth_processes[container_name]
+    previous = _auth_processes.pop(container_name, None)
+    if previous is not None:
+        await asyncio.to_thread(previous.close)
 
     def _start_auth() -> dict:
-        proc = subprocess.Popen(
-            ["docker", "exec", container_name,
-             "/usr/local/bin/code", "tunnel", "user", "login",
-             "--provider", "github"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+        execution = TunnelExec(
+            container_name, [_TUNNEL_CLI, "tunnel", "user", "login", "--provider", "github"]
         )
-        _auth_processes[container_name] = proc
-
-        # Read output lines looking for the device URL and code
-        output_lines = []
-        device_url = None
-        device_code = None
-        deadline = time.time() + 30
-
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                continue
-            output_lines.append(line.strip())
-            full_output = " ".join(output_lines)
-
-            url_match = re.search(r'(https://github\.com/login/device)', full_output)
-            if url_match:
-                device_url = url_match.group(1)
-
-            code_match = re.search(r'code\s+([A-Z0-9]{4}-[A-Z0-9]{4})', full_output, re.IGNORECASE)
-            if code_match:
-                device_code = code_match.group(1)
-
-            if device_url and device_code:
-                return {
-                    "status": "waiting_for_browser",
-                    "device_url": device_url,
-                    "device_code": device_code,
-                    "message": f"Open {device_url} and enter code {device_code}",
-                }
-
-        if proc.poll() is not None and proc.returncode == 0:
-            if container_name in _auth_processes:
-                del _auth_processes[container_name]
-            return {"status": "already_authenticated"}
-
-        if container_name in _auth_processes:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            del _auth_processes[container_name]
-        return {
-            "status": "error",
-            "message": "Could not get device code. Output: " + "\n".join(output_lines[-5:]),
-        }
+        keep_open = False
+        try:
+            output_lines = []
+            deadline = time.monotonic() + 30
+            while (line := execution.read_line(deadline)) is not None:
+                output_lines.append(line)
+                output = " ".join(output_lines)
+                url = re.search(r"https://github\.com/login/device", output)
+                code = re.search(r"code\s+([A-Z0-9]{4}-[A-Z0-9]{4})", output, re.IGNORECASE)
+                if url and code:
+                    device_url, device_code = url.group(), code.group(1)
+                    _auth_processes[container_name] = execution
+                    keep_open = True
+                    return {
+                        "status": "waiting_for_browser",
+                        "device_url": device_url,
+                        "device_code": device_code,
+                        "message": f"Open {device_url} and enter code {device_code}",
+                    }
+            if execution.returncode == 0:
+                return {"status": "already_authenticated"}
+            return {
+                "status": "error",
+                "message": "Could not get device code. " + "".join(output_lines[-5:]).strip(),
+            }
+        finally:
+            if not keep_open:
+                execution.close()
 
     try:
         return await asyncio.to_thread(_start_auth)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="GitHub sign-in timed out.") from None
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -427,16 +413,16 @@ async def tunnel_auth_status(project_name: str, dev_name: str) -> dict:
     info = _tunnel_info(project_name, dev_name)
     container_name = info["container_name"]
 
-    proc = _auth_processes.get(container_name)
-    if proc is None:
+    execution = _auth_processes.get(container_name)
+    if execution is None:
         return {"status": "no_pending_auth"}
 
-    poll = proc.poll()
-    if poll is None:
+    returncode = execution.returncode
+    if returncode is None:
         return {"status": "waiting_for_browser"}
 
     del _auth_processes[container_name]
-    if poll == 0:
+    if returncode == 0:
         return {"status": "authenticated"}
     else:
-        return {"status": "failed", "message": f"Auth process exited with code {poll}"}
+        return {"status": "failed", "message": f"Auth process exited with code {returncode}"}
